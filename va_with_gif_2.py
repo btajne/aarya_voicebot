@@ -4,7 +4,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import sounddevice as sd
-import numpy as np
 import requests
 import wave
 import tempfile
@@ -20,135 +19,134 @@ import logging
 import datetime
 import re
 
-# ===========================================
-# SET YOUR USB MICROPHONE
-# ===========================================
-MIC_INDEX = 1  # Replace with your USB mic index from sd.query_devices()
+# ================================
+# CONFIG
+# ================================
+MIC_INDEX = 1
 SAMPLE_RATE = 48000
 RECORD_SECONDS = 7
-logging.basicConfig(level=logging.ERROR)
 STATE = "IDLE"
+reply = ""
 
-# ===========================================
-# CONFIG
-# ===========================================
 ELEVEN_API_KEY = "sk_527b4e2851fb5e97621d473c099f9f3da5eb062abb18b381"
 STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
-# ===========================================
-# GIF GUI PLAYER
-# ===========================================
+logging.basicConfig(level=logging.ERROR)
+
+# ================================
+# GUI CLASS
+# ================================
 class GifPlayer(tk.Tk):
     def __init__(self, gifs):
         super().__init__()
+
         self.title("Aarya VoiceBot")
-        self.configure(bg="#000")
-        self.geometry("1024x600")
-        self.resizable(False, False)
+        self.configure(bg="black")
+        self.attributes("-fullscreen", True)
+        self.bind("<q>", self.exit_app)
+        self.bind("<Q>", self.exit_app)
 
-        self.frame = tk.Frame(self, bg="#000")
-        self.frame.place(relx=0.5, rely=0.47, anchor="center", width=900, height=480)
+        w, h = self.winfo_screenwidth(), self.winfo_screenheight()
 
-        self.label = tk.Label(self.frame, bg="#000")
-        self.label.pack(fill="both", expand=True)
+        self.canvas = tk.Label(self, bg="black")
+        self.canvas.pack(fill="both", expand=True)
 
         self.frames = {}
         self.delays = {}
 
-        for state, path in gifs.items():
+        for key, path in gifs.items():
             img = Image.open(path)
             fl, dl = [], []
             for frame in ImageSequence.Iterator(img):
-                frame = frame.convert("RGBA").resize((900, 480), Image.Resampling.LANCZOS)
+                frame = frame.convert("RGB").resize((w, h))
                 fl.append(ImageTk.PhotoImage(frame))
-                dl.append(frame.info.get("duration", 60))
-            self.frames[state] = fl
-            self.delays[state] = dl
+                dl.append(max(30, frame.info.get("duration", 40)))
 
-        self.current_state = None
-        self.frame_index = 0
+            self.frames[key] = fl
+            self.delays[key] = dl
+
+        self.state_now = None
+        self.index = 0
 
         self.btn = tk.Button(
             self,
             text="Activate Aarya",
-            font=("Helvetica", 35, "bold"),
-            command=self.on_button_press,
-            bg="#000",
+            font=("Arial", 46, "bold"),
             fg="white",
+            bg="black",
+            activeforeground="cyan",
+            command=self.activate,
             bd=0
         )
-        self.btn.place_forget()  # Initially hidden
+        self.btn.place(relx=0.5, rely=0.5, anchor="center")
 
-    def hide_button(self): 
+    def exit_app(self, event=None):
+        os._exit(0)
+
+    def activate(self):
+        global STATE
+        STATE = "RECORDING"
         self.btn.place_forget()
 
     def show_button(self):
-        # Show only if IDLE
         if STATE == "IDLE":
             self.btn.place(relx=0.5, rely=0.5, anchor="center")
 
-    def on_button_press(self):
-        global STATE
-        STATE = "RECORDING"
-        self.hide_button()
-
     def show(self, state):
-        if self.current_state != state:
-            self.current_state = state
-            self.frame_index = 0
+        if self.state_now != state:
+            self.state_now = state
+            self.index = 0
             self.animate()
 
     def animate(self):
-        if not self.current_state:
+        frames = self.frames.get(self.state_now, [])
+        if not frames:
             return
-        frames = self.frames[self.current_state]
-        delay = self.delays[self.current_state][self.frame_index]
-        self.label.config(image=frames[self.frame_index])
-        self.frame_index = (self.frame_index + 1) % len(frames)
+
+        self.canvas.config(image=frames[self.index])
+        delay = self.delays[self.state_now][self.index]
+        self.index = (self.index + 1) % len(frames)
+
         self.after(delay, self.animate)
 
-# ===========================================
+# ================================
 # AUDIO RECORD
-# ===========================================
+# ================================
 def record_fixed_time():
-    print("🎤 Recording...")
-    audio = sd.rec(
-        int(RECORD_SECONDS * SAMPLE_RATE),
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        device=MIC_INDEX
-    )
+    audio = sd.rec(int(RECORD_SECONDS * SAMPLE_RATE),
+                   samplerate=SAMPLE_RATE,
+                   channels=1,
+                   dtype="int16",
+                   device=MIC_INDEX)
     sd.wait()
     return audio
 
-# ===========================================
-# SAVE WAV
-# ===========================================
 def write_wav(audio):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    with wave.open(tmp.name, "wb") as wf:
+    file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    with wave.open(file.name, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio.tobytes())
-    return tmp.name
+    return file.name
 
-# ===========================================
+# ================================
 # SPEECH TO TEXT
-# ===========================================
-def transcribe_audio(path):
-    headers = {"xi-api-key": ELEVEN_API_KEY}
-    data = {"model_id": "scribe_v1", "language_code": "en"}
-    with open(path, "rb") as f:
-        r = requests.post(STT_URL, headers=headers, files={"file": f}, data=data)
-    if r.status_code == 200:
-        return r.json().get("text", "")
-    return ""
+# ================================
+def transcribe_audio(file):
+    with open(file, "rb") as f:
+        res = requests.post(
+            STT_URL,
+            headers={"xi-api-key": ELEVEN_API_KEY},
+            files={"file": f},
+            data={"model_id": "scribe_v1", "language_code": "en"}
+        )
 
-# ===========================================
-# COMMAND BRAIN
-# ===========================================
+    return res.json().get("text", "") if res.status_code == 200 else ""
+
+# ================================
+# BRAIN
+# ================================
 def answer_command(cmd: str) -> str:
     """
     Aarya Voice Assistant – Robust Command Answering Function
@@ -266,60 +264,83 @@ def answer_command(cmd: str) -> str:
         return "ecruxbot is a robotics company which make educational and industrial robots"
 
     # --- Default Fallback ---
-    return f"I heard: {cmd}" if cmd else "I didn’t catch that. Could you please repeat?"
+    return f"I didn’t catch that. Could you please repeat?"
 
-
-
-# ===========================================
-# TEXT TO SPEECH
-# ===========================================
-async def _tts(text, path):
-    tts = edge_tts.Communicate(text, voice="en-US-AriaNeural")
-    await tts.save(path)
+# ================================
+# TEXT TO SPEAK
+# ================================
+async def _tts(text, filename):
+    tts = edge_tts.Communicate(text, voice="en-IN-NeerjaNeural")
+    await tts.save(filename)
 
 def speak_text(text):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-    asyncio.run(_tts(text, tmp))
-    subprocess.run(["mpg123", "-q", tmp])
-    os.remove(tmp)
+    file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    asyncio.run(_tts(text, file))
+    subprocess.run(["mpg123", "-q", file])
+    os.remove(file)
 
-# ===========================================
-# MAIN VOICE LOOP
-# ===========================================
+# ================================
+# THREAD WORKERS
+# ================================
+def record_process():
+    global STATE, reply
+
+    audio = record_fixed_time()
+    path = write_wav(audio)
+
+    text = transcribe_audio(path)
+    os.remove(path)
+
+    reply = answer_command(text)
+
+    print("\n----------------")
+    print("You   :", text)
+    print("Aarya :", reply)
+    print("----------------\n")
+
+    STATE = "SPEAKING"
+
+
+def speak_process():
+    global STATE
+    speak_text(reply)
+    STATE = "IDLE"
+
+# ================================
+# MAIN LOOP
+# ================================
 def run_voice(gui):
     global STATE
-    reply = ""
+
     while True:
         if STATE == "IDLE":
             gui.after(0, gui.show, "idle")
             gui.after(0, gui.show_button)
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         elif STATE == "RECORDING":
             gui.after(0, gui.show, "listening")
-            audio = record_fixed_time()
-            wav = write_wav(audio)
-            text = transcribe_audio(wav)
-            os.remove(wav)
-            print("❓", text)
-            reply = answer_command(text)
-            print("💬", reply)
-            STATE = "SPEAKING"
+            threading.Thread(target=record_process, daemon=True).start()
+            while STATE == "RECORDING":
+                time.sleep(0.05)
 
         elif STATE == "SPEAKING":
             gui.after(0, gui.show, "speaking")
-            speak_text(reply)
-            STATE = "IDLE"
+            threading.Thread(target=speak_process, daemon=True).start()
+            while STATE == "SPEAKING":
+                time.sleep(0.05)
 
-# ===========================================
-# START PROGRAM
-# ===========================================
+# ================================
+# START
+# ================================
 if __name__ == "__main__":
+
     gifs = {
         "idle": "idle_black.gif",
         "listening": "thinking.gif",
-        "speaking": "speaking.gif",
+        "speaking": "speaking.gif"
     }
+
     app = GifPlayer(gifs)
     threading.Thread(target=run_voice, args=(app,), daemon=True).start()
     app.mainloop()
