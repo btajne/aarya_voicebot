@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -14,7 +13,8 @@ import subprocess
 import edge_tts
 import threading
 import tkinter as tk
-from PIL import Image, ImageTk, ImageSequence
+from PIL import Image, ImageTk
+import cv2
 import logging
 import datetime
 import re
@@ -28,63 +28,33 @@ RECORD_SECONDS = 7
 STATE = "IDLE"
 reply = ""
 
-ELEVEN_API_KEY = "sk_527b4e2851fb5e97621d473c099f9f3da5eb062abb18b381"
+ELEVEN_API_KEY = "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"
 STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 logging.basicConfig(level=logging.ERROR)
 
 # ================================
-# GUI CLASS
+# VIDEO PLAYER GUI CLASS
 # ================================
-class GifPlayer(tk.Tk):
-    def __init__(self, gifs):
+class VideoPlayer(tk.Tk):
+    def __init__(self, videos):
         super().__init__()
 
         self.title("Aarya VoiceBot")
-        self.configure(bg="black")
         self.attributes("-fullscreen", True)
-        self.bind("<q>", self.exit_app)
-        self.bind("<Q>", self.exit_app)
+        self.configure(bg="black")
+        self.bind("<q>", lambda e: os._exit(0))
+        self.bind("<Q>", lambda e: os._exit(0))
 
-        w, h = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.w = self.winfo_screenwidth()
+        self.h = self.winfo_screenheight()
 
-        self.canvas = tk.Label(self, bg="black")
-        self.canvas.pack(fill="both", expand=True)
+        self.label = tk.Label(self, bg="black")
+        self.label.pack(fill="both", expand=True)
 
-        self.frames = {}
-        self.delays = {}
-
-        # --------- GIF LOADER (OPTIMIZED FOR LARGE FILES) ---------- #
-        for key, path in gifs.items():
-            print("Loading:", path)
-            img = Image.open(path)
-
-            fl, dl = [], []
-
-            for i, frame in enumerate(ImageSequence.Iterator(img)):
-                if i > 250:   # Prevent RAM crash for huge GIFs
-                    break
-
-                delay = frame.info.get("duration", 40)
-
-                frame = frame.copy()
-                frame.thumbnail((w, h))   # Scale to screen safely
-
-                if frame.mode != "RGBA":
-                    frame = frame.convert("RGBA")
-
-                fl.append(ImageTk.PhotoImage(frame))
-                dl.append(max(30, delay))
-
-            self.frames[key] = fl
-            self.delays[key] = dl
-
-        print("\nGIF LOAD REPORT:")
-        for k in self.frames:
-            print(k, "=>", len(self.frames[k]), "frames")
-
-        self.state_now = None
-        self.index = 0
+        self.videos = videos
+        self.cap = None
+        self.current_state = None
 
         self.btn = tk.Button(
             self,
@@ -92,14 +62,13 @@ class GifPlayer(tk.Tk):
             font=("Arial", 46, "bold"),
             fg="white",
             bg="black",
-            activeforeground="cyan",
             command=self.activate,
-            bd=0
+            bd=0,
+            activeforeground="cyan"
         )
         self.btn.place(relx=0.5, rely=0.5, anchor="center")
 
-    def exit_app(self, event=None):
-        os._exit(0)
+        self.show("idle")
 
     def activate(self):
         global STATE
@@ -110,31 +79,46 @@ class GifPlayer(tk.Tk):
         if STATE == "IDLE":
             self.btn.place(relx=0.5, rely=0.5, anchor="center")
 
-    def show(self, state):
-        if self.state_now != state:
-            self.state_now = state
-            self.index = 0
-            self.after(1, self.animate)
+    def open_video(self, path):
+        if self.cap:
+            self.cap.release()
 
-    def animate(self):
-        frames = self.frames.get(self.state_now, [])
-        if not frames:
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            print("❌ Cannot open video:", path)
+
+    def show(self, state):
+        if state != self.current_state:
+            self.current_state = state
+            self.open_video(self.videos[state])
+            self.after(5, self.play)
+
+    def play(self):
+        if not self.cap:
             return
 
-        self.canvas.config(image=frames[self.index])
-        delay = self.delays[self.state_now][self.index]
-        self.index = (self.index + 1) % len(frames)
+        ret, frame = self.cap.read()
+        if not ret:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap.read()
 
-        self.after(delay, self.animate)
+        if ret:
+            frame = cv2.resize(frame, (self.w, self.h))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = ImageTk.PhotoImage(Image.fromarray(frame))
+            self.label.imgtk = img
+            self.label.config(image=img)
+
+        self.after(30, self.play)
 
 # ================================
-# AUDIO RECORD
+# RECORD AUDIO
 # ================================
 def record_fixed_time():
     audio = sd.rec(int(RECORD_SECONDS * SAMPLE_RATE),
                    samplerate=SAMPLE_RATE,
                    channels=1,
-                   dtype="int16",
+                   dtype='int16',
                    device=MIC_INDEX)
     sd.wait()
     return audio
@@ -153,18 +137,15 @@ def write_wav(audio):
 # ================================
 def transcribe_audio(file):
     with open(file, "rb") as f:
-        res = requests.post(
-            STT_URL,
-            headers={"xi-api-key": ELEVEN_API_KEY},
-            files={"file": f},
-            data={"model_id": "scribe_v1", "language_code": "en"}
-        )
+        res = requests.post(STT_URL,
+                            headers={"xi-api-key": ELEVEN_API_KEY},
+                            files={"file": f},
+                            data={"model_id": "scribe_v1", "language_code": "en"})
 
     return res.json().get("text", "") if res.status_code == 200 else ""
 
 # ================================
-# BRAIN
-# ================================
+# BASIC COMMAND LOGIC
 def answer_command(cmd: str) -> str:
     """
     Aarya Voice Assistant – Robust Command Answering Function
@@ -285,7 +266,7 @@ def answer_command(cmd: str) -> str:
     return f"I didn’t catch that. Could you please repeat?"
 
 # ================================
-# TEXT TO SPEAK
+# TEXT TO SPEECH
 # ================================
 async def _tts(text, filename):
     tts = edge_tts.Communicate(text, voice="en-IN-NeerjaNeural")
@@ -333,7 +314,7 @@ def run_voice(gui):
         if STATE == "IDLE":
             gui.after(0, gui.show, "idle")
             gui.after(0, gui.show_button)
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         elif STATE == "RECORDING":
             gui.after(0, gui.show, "listening")
@@ -352,13 +333,13 @@ def run_voice(gui):
 # ================================
 if __name__ == "__main__":
 
-    gifs = {
-        "idle": "idle_black.gif",
-        "listening": "Aarya.gif",        # ✅ Your Aarya animation
-        "speaking": "Aarya_speak.gif"    # ✅ Your speaking animation
+    videos = {
+        "idle": "aarya_idle.mp4",
+        "listening": "aarya_listening.mp4",
+        "speaking": "aarya_speaking.mp4"
     }
 
-    app = GifPlayer(gifs)
+    app = VideoPlayer(videos)
     threading.Thread(target=run_voice, args=(app,), daemon=True).start()
     app.mainloop()
 
