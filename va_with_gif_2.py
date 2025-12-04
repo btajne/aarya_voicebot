@@ -269,6 +269,7 @@ def answer_command(cmd: str) -> str:
     return f"I heard: {cmd}" if cmd else "I didn’t catch that. Could you please repeat?"
 
 
+
 # ===========================================
 # TEXT TO SPEECH
 # ===========================================
