@@ -3,38 +3,30 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import sounddevice as sd
-import requests
-import wave
-import tempfile
-import os
-import time
-import asyncio
-import subprocess
+import requests, wave, tempfile, os, time, asyncio, subprocess
 import edge_tts
 import threading
 import tkinter as tk
 from PIL import Image, ImageTk
 import cv2
-import logging
-import datetime
-import re
+import datetime, re
 
 # ================================
 # CONFIG
 # ================================
-MIC_INDEX = 1
+MIC_DEVICE = "hw:1,0"        # ✅ USB mic
 SAMPLE_RATE = 48000
-RECORD_SECONDS = 7
+RECORD_SECONDS = 6
+
 STATE = "IDLE"
 reply = ""
 
-ELEVEN_API_KEY = "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"
+ELEVEN_API_KEY = "sk_527b4e2851fb5e97621d473c099f9f3da5eb062abb18b381"
 STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
-logging.basicConfig(level=logging.ERROR)
 
 # ================================
-# VIDEO PLAYER GUI CLASS
+# VIDEO PLAYER
 # ================================
 class VideoPlayer(tk.Tk):
     def __init__(self, videos):
@@ -44,7 +36,6 @@ class VideoPlayer(tk.Tk):
         self.attributes("-fullscreen", True)
         self.configure(bg="black")
         self.bind("<q>", lambda e: os._exit(0))
-        self.bind("<Q>", lambda e: os._exit(0))
 
         self.w = self.winfo_screenwidth()
         self.h = self.winfo_screenheight()
@@ -55,11 +46,11 @@ class VideoPlayer(tk.Tk):
         self.videos = videos
         self.cap = None
         self.current_state = None
+        self.frame_job = None
 
-        self.btn = tk.Button(
-            self,
+        self.btn = tk.Button(self,
             text="Activate Aarya",
-            font=("Arial", 46, "bold"),
+            font=("Arial", 42, "bold"),
             fg="white",
             bg="black",
             command=self.activate,
@@ -83,47 +74,65 @@ class VideoPlayer(tk.Tk):
         if self.cap:
             self.cap.release()
 
-        self.cap = cv2.VideoCapture(path)
+        self.cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+
         if not self.cap.isOpened():
-            print("❌ Cannot open video:", path)
+            print("❌ Cannot open:", path)
+            return False
+
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return True
 
     def show(self, state):
-        if state != self.current_state:
-            self.current_state = state
-            self.open_video(self.videos[state])
-            self.after(5, self.play)
+        if state == self.current_state:
+            return
 
-    def play(self):
+        print("🎬 Switching to:", state)
+
+        self.current_state = state
+
+        if self.frame_job:
+            self.after_cancel(self.frame_job)
+
+        ok = self.open_video(self.videos[state])
+        if ok:
+            self.update_frame()
+
+    def update_frame(self):
         if not self.cap:
             return
 
         ret, frame = self.cap.read()
+
         if not ret:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = self.cap.read()
+            if not ret:
+                return
 
-        if ret:
-            frame = cv2.resize(frame, (self.w, self.h))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = ImageTk.PhotoImage(Image.fromarray(frame))
-            self.label.imgtk = img
-            self.label.config(image=img)
+        frame = cv2.resize(frame, (self.w, self.h))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        self.after(30, self.play)
+        img = ImageTk.PhotoImage(Image.fromarray(frame))
+        self.label.config(image=img)
+        self.label.image = img
+
+        self.frame_job = self.after(33, self.update_frame)   # ~30fps
+
 
 # ================================
-# RECORD AUDIO
+# AUDIO RECORD
 # ================================
 def record_fixed_time():
-    audio = sd.rec(int(RECORD_SECONDS * SAMPLE_RATE),
-                   samplerate=SAMPLE_RATE,
-                   channels=1,
-                   dtype='int16',
-                   device=MIC_INDEX)
-    sd.wait()
-    return audio
+    return sd.rec(int(RECORD_SECONDS * SAMPLE_RATE),
+             samplerate=SAMPLE_RATE,
+             channels=1,
+             dtype='int16',
+             device=MIC_DEVICE)
+
 
 def write_wav(audio):
+    sd.wait()
     file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     with wave.open(file.name, "wb") as wf:
         wf.setnchannels(1)
@@ -132,45 +141,35 @@ def write_wav(audio):
         wf.writeframes(audio.tobytes())
     return file.name
 
+
 # ================================
 # SPEECH TO TEXT
 # ================================
 def transcribe_audio(file):
     with open(file, "rb") as f:
-        res = requests.post(STT_URL,
-                            headers={"xi-api-key": ELEVEN_API_KEY},
-                            files={"file": f},
-                            data={"model_id": "scribe_v1", "language_code": "en"})
+        r = requests.post(STT_URL,
+            headers={"xi-api-key": ELEVEN_API_KEY},
+            files={"file": f},
+            data={"model_id": "scribe_v1", "language_code": "en"}
+        )
+    return r.json().get("text", "") if r.status_code == 200 else ""
 
-    return res.json().get("text", "") if res.status_code == 200 else ""
 
 # ================================
-# BASIC COMMAND LOGIC
+# BRAIN
+# ================================
 def answer_command(cmd: str) -> str:
-    """
-    Aarya Voice Assistant – Robust Command Answering Function
-    ----------------------------------------------------------
-    - Handles greetings, date/time, robotics Q&A, tech, and politics.
-    - Prevents substring conflicts (like 'hi' in 'chief', 'pm' in 'computer').
-    - Case-insensitive and punctuation-tolerant.
-    """
-
     import datetime, time, re
-
-    # --- Normalize input ---
-    t = cmd.lower().strip()
-    t = re.sub(r'[^\w\s]', '', t)  # remove punctuation for clean matching
+    t = (cmd or "").lower().strip()
+    t = re.sub(r'[^\w\s]', '', t)
     now = datetime.datetime.now()
 
-    # --- Helper functions ---
     def contains_word(word_list):
-        """Return True if any full word or phrase appears in text."""
         for w in word_list:
             if re.search(rf'\b{re.escape(w)}\b', t):
                 return True
         return False
 
-    # --- Basic System Responses ---
     if contains_word(["time"]):
         return now.strftime("The current time is %I:%M %p.")
     if contains_word(["date"]):
@@ -179,24 +178,16 @@ def answer_command(cmd: str) -> str:
         return now.strftime("Today is %A.")
     if contains_word(["joke", "funny"]):
         return "Why did the computer go to the doctor? Because it had a bad byte!"
-
-    # --- Greetings ---
     if contains_word(["hello", "hi", "hey", "namaste", "good morning", "good afternoon", "good evening"]):
         return "Hi, I’m Aarya, your receptionist robot. How can I assist you today?"
     if "how are you" in t:
         return "I'm feeling fantastic, thank you for asking!"
     if contains_word(["your name", "who are you"]):
         return "My name is Aarya. I’m a humanoid receptionist robot developed by Ecruxbot."
-
-    # --- Date / Time / Place ---
     if contains_word(["month"]):
         return f"The current month is {time.strftime('%B')}."
     if contains_word(["year"]):
         return f"The current year is {time.strftime('%Y')}."
-    #if contains_word(["place", "where are you", "location"]):
-    #  return "Right now, I’m at the Tech Event in Jalgaon, Maharashtra."
-
-    # --- About Aarya ---
     if contains_word(["purpose", "what is your purpose", "tell me about yourself", "why you", "purpose of you"]):
         return "I’m designed to interact with people, share information, and assist at events, offices, and exhibitions."
     if contains_word(["who created you", "who made you", "your creator"]):
@@ -219,8 +210,6 @@ def answer_command(cmd: str) -> str:
         return "Yes, I can be customized for different industries, events, or organizations."
     if contains_word(["price", "cost"]):
         return "I’m a prototype developed for demonstrations. Future commercial versions will be available on request."
-
-    # --- Industrial Robotics ---
     if contains_word(["do you make industrial robots", "industrial robots"]):
         return "Yes, Ecruxbot designs and builds industrial robots, including autonomous systems and robotic arms."
     if contains_word(["robotic arm", "6 degree arm", "six degree arm"]):
@@ -229,8 +218,6 @@ def answer_command(cmd: str) -> str:
         return "Yes, we’re also building autonomous robots for various industrial and service applications."
     if contains_word(["custom robots", "do you make custom robots"]):
         return "Yes, we create customized robots tailored to specific industry or educational requirements."
-
-    # --- Tech Event Context ---
     if contains_word(["can i buy your products", "buy your product", "buy your robots"]):
         return "Yes! You can talk to our team here or visit our website ecruxbot.in for details."
     if contains_word(["website"]):
@@ -239,73 +226,60 @@ def answer_command(cmd: str) -> str:
         return "You can reach us anytime at ecruxbot@gmail.com."
     if contains_word(["other events", "exhibitions"]):
         return "We regularly participate in tech exhibitions and educational events across India."
-
-    # --- Tech & AI ---
     if contains_word(["tinyml"]):
         return "TinyML stands for Tiny Machine Learning — running AI models on small microcontrollers like the Raspberry Pi Pico."
     if contains_word(["ai in robotics", "artificial intelligence in robotics"]):
         return "AI gives robots the ability to see, listen, and respond intelligently to human behavior."
     if contains_word(["future of robotics"]):
         return "The future of robotics lies in human-robot collaboration powered by Artificial Intelligence."
-
-    # --- Maharashtra / Politics ---
     if contains_word(["chief minister", "cm"]):
         return "The Chief Minister of Maharashtra is Devendra Fadnavis."
     if contains_word(["prime minister", "pm"]):
         return "The Prime Minister of India is Narendra Modi."
-    #if contains_word(["member of parliament", "mp", "khasdar"]):
-    #    return "The Member of Parliament for Jalgaon is Smita Tai Wagh."
-    #if contains_word(["smita wagh"]):
-     #   return "Smita Wagh is the current Member of Parliament for Jalgaon."
-    #if contains_word(["member of legislative assembly", "mla", "aamdar"]):
-     #   return "The Member of the Legislative Assembly for Jalgaon is Raju Mama Bhole."
     if contains_word(["company"]):
         return "ecruxbot is a robotics company which make educational and industrial robots"
 
-    # --- Default Fallback ---
-    return f"I didn’t catch that. Could you please repeat?"
+    return "I didn’t catch that. Could you please repeat?"
+
 
 # ================================
 # TEXT TO SPEECH
 # ================================
-async def _tts(text, filename):
-    tts = edge_tts.Communicate(text, voice="en-IN-NeerjaNeural")
-    await tts.save(filename)
+async def tts_run(text, file):
+    voice = edge_tts.Communicate(text, voice="en-IN-NeerjaNeural")
+    await voice.save(file)
 
 def speak_text(text):
     file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-    asyncio.run(_tts(text, file))
+    asyncio.run(tts_run(text, file))
     subprocess.run(["mpg123", "-q", file])
     os.remove(file)
+
 
 # ================================
 # THREAD WORKERS
 # ================================
-def record_process():
+def record_thread():
     global STATE, reply
-
     audio = record_fixed_time()
     path = write_wav(audio)
-
     text = transcribe_audio(path)
     os.remove(path)
-
     reply = answer_command(text)
 
-    print("\n----------------")
-    print("You   :", text)
-    print("Aarya :", reply)
-    print("----------------\n")
-
+    print("USER:", text)
+    print("BOT:", reply)
     STATE = "SPEAKING"
 
-def speak_process():
+
+def speak_thread():
     global STATE
     speak_text(reply)
     STATE = "IDLE"
 
+
 # ================================
-# MAIN LOOP
+# MAIN BRAIN LOOP
 # ================================
 def run_voice(gui):
     global STATE
@@ -314,25 +288,24 @@ def run_voice(gui):
         if STATE == "IDLE":
             gui.after(0, gui.show, "idle")
             gui.after(0, gui.show_button)
-            time.sleep(0.1)
 
         elif STATE == "RECORDING":
             gui.after(0, gui.show, "listening")
-            threading.Thread(target=record_process, daemon=True).start()
-            while STATE == "RECORDING":
-                time.sleep(0.05)
+            STATE = "BUSY"
+            threading.Thread(target=record_thread, daemon=True).start()
 
         elif STATE == "SPEAKING":
             gui.after(0, gui.show, "speaking")
-            threading.Thread(target=speak_process, daemon=True).start()
-            while STATE == "SPEAKING":
-                time.sleep(0.05)
+            STATE = "BUSY"
+            threading.Thread(target=speak_thread, daemon=True).start()
+
+        time.sleep(0.05)
+
 
 # ================================
 # START
 # ================================
 if __name__ == "__main__":
-
     videos = {
         "idle": "aarya_idle.mp4",
         "listening": "aarya_listening.mp4",
